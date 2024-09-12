@@ -1,0 +1,59 @@
+version: '3.9'
+
+networks:
+  traefik:
+    external: true
+
+volumes:
+  minio_data:
+    name: minio_data
+  
+services:
+  minio:
+    image: minio/minio:RELEASE.2024-09-09T16-59-28Z
+    container_name: minio
+    restart: always
+    env_file: ./.env
+    networks:
+      - traefik
+    ports:
+      - 9001
+      - 9000
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_PROMETHEUS_AUTH_TYPE: public 
+      MINIO_PROMETHEUS_URL: http://prometheus-1:9090
+      MINIO_PROMETHEUS_JOB_ID: minio
+    command: server /data --address ':9000' --console-address ':9001'
+    volumes:
+      - minio_data:/data
+    labels:
+      # Dynamic configuration with Docker Labels
+      # Ref: https://docs.traefik.io/reference/dynamic-configuration/docker/
+      # Explicitly tell Traefik to expose this container
+      - "traefik.enable=true"
+      # The domain the service will respond to
+      - "traefik.http.routers.minio-web-router.rule=Host(`minio-docker-1.domain.com`)"
+      # Allow request only from the predefined entry point named "web"
+      - "traefik.http.routers.minio-web-router.entrypoints=web"
+      # Set the service parameter on the router.
+      - "traefik.http.routers.minio-web-router.service=minio-web-service"
+      # Forwarding requests to more than one port on a container requires referencing the "
+      # service loadbalancer port definition using the service parameter on the router.
+      - "traefik.http.services.minio-web-service.loadbalancer.server.port=9001"
+    healthcheck:
+      # test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: timeout 5s bash -c ':> /dev/tcp/127.0.0.1/9000' || exit 1
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: 127.0.0.1:24224 
+        fluentd-async: 'true'
+        # # Tag for Fluent Bit to Loki
+        # tag: loki.minio  
+        # Tag for Fluent Bit to Elasticsearch
+        tag: elastic.minio

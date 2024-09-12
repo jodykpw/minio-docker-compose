@@ -1,0 +1,89 @@
+variables:
+  REMOTE_SERVER_DEPLOY_FOLDER: "/home/docker-cicd/cicd-deploy/${CI_PROJECT_NAME}"
+
+default:
+  image: docker:27.2.1
+  before_script:
+    # Use to start the SSH agent and set up the necessary environment variables in the current shell session.
+    - eval $(ssh-agent -s)
+    # Takes the processed private key and pipes it into ssh-add, which adds the key to the SSH agent.
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    # Add the ip address of a remote server to the known_hosts file on the gitlab runner build folder. 
+    - ssh-keyscan $REMOTE_IPADDRESS >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+    # The scp command itself doesn't have a direct equivalent for the --exclude and --include options like rsync does. 
+    # scp is simpler and doesn't offer the same advanced filtering capabilities.
+    - apk add rsync 
+
+stages:
+  - test
+  - deploy
+  - shutdown
+  - destroy
+  - cleanup
+
+# Delete deploy project repo on remote server.
+.cleanup_job: &cleanup_job
+    # USER docker-cicd id: 1002, GROUP docker-cicd id: 1003
+    - ssh $SSH_DOCKER_USER@$REMOTE_IPADDRESS "docker run --rm -v ${REMOTE_SERVER_DEPLOY_FOLDER}:/workdir busybox /bin/sh -c 'chown -R 1002:1003 /workdir'"
+    - ssh $SSH_DOCKER_USER@$REMOTE_IPADDRESS "rm -rf ${REMOTE_SERVER_DEPLOY_FOLDER}"
+
+# Using SSH and rsync to copy project files to a remote server
+.deployment_job: &deployment_job
+    # Creates a directory on the remote server for the project.
+    - ssh $SSH_DOCKER_USER@$REMOTE_IPADDRESS mkdir -p cicd-deploy/${CI_PROJECT_NAME}
+    # Uses rsync to copy project files to the remote server, excluding the .git directory.
+    - rsync -av --exclude='.git' --include='.*' --include='*' -e ssh "${CI_PROJECT_DIR}/" "$SSH_DOCKER_USER@$REMOTE_IPADDRESS:cicd-deploy/${CI_PROJECT_NAME}/"
+
+test_ssh_connection:
+  stage: test
+  script:
+    # Checks the SSH connection to the remote server by attempting to execute pwd and ls -la commands.
+    - ssh -o BatchMode=yes -o ConnectTimeout=5 $SSH_DOCKER_USER@$REMOTE_IPADDRESS 'pwd; ls -la'
+  tags:
+    - docker-socket
+
+ssh_scp_docker-compose-up:
+  stage: deploy
+  script:
+    - *deployment_job 
+    # Overwritten the .env variables using GitLab CI/CD variables
+    - ssh $SSH_DOCKER_USER@$REMOTE_IPADDRESS "MINIO_ROOT_USER=${MINIO_ROOT_USER} MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD} docker-compose --env-file ${REMOTE_SERVER_DEPLOY_FOLDER}/.env -f ${REMOTE_SERVER_DEPLOY_FOLDER}/docker-compose.yml up -d"
+    - *cleanup_job
+  needs: ["test_ssh_connection"]
+  when: manual
+  tags:
+    - docker-socket
+
+cleanup_deployment_failure:
+  stage: cleanup
+  script:
+    - *cleanup_job
+  needs: ["ssh_scp_docker-compose-up"]
+  when: on_failure
+
+ssh_scp_docker-compose-down:
+  stage: shutdown
+  script:
+    - *deployment_job
+    # Docker Compose to stop and remove containers, networks, and volumes defined in the Compose file.
+    - ssh $SSH_DOCKER_USER@$REMOTE_IPADDRESS "MINIO_ROOT_USER=${MINIO_ROOT_USER} MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD} docker-compose --env-file ${REMOTE_SERVER_DEPLOY_FOLDER}/.env -f ${REMOTE_SERVER_DEPLOY_FOLDER}/docker-compose.yml down"
+    - *cleanup_job
+  needs: ["ssh_scp_docker-compose-up"]
+  when: manual
+  tags:
+    - docker-socket
+
+ssh_scp_docker-compose-remove:
+  stage: destroy
+  script:
+    - *deployment_job
+    # Remove named volumes declared in your docker-compose.yml
+    - ssh $SSH_DOCKER_USER@$REMOTE_IPADDRESS "MINIO_ROOT_USER=${MINIO_ROOT_USER} MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD} docker-compose --env-file ${REMOTE_SERVER_DEPLOY_FOLDER}/.env -f ${REMOTE_SERVER_DEPLOY_FOLDER}/docker-compose.yml down --volumes"
+    - *cleanup_job
+  needs: ["ssh_scp_docker-compose-up"]
+  when: manual
+  tags:
+    - docker-socket
